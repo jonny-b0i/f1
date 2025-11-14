@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mini F1 Racing - ERS & DRS Zones</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#071225; color:#e8f1f7; font-family:Arial,sans-serif;}
+  canvas { background:#062b40; display:block; margin:auto; border-radius:8px; box-shadow:0 6px 18px rgba(0,0,0,.6);}
+  #hud { width:320px; position:absolute; top:10px; left:10px; background:linear-gradient(180deg,#041220,#062a3a); padding:12px; border-radius:8px; font-size:14px;}
+  #hud div { margin-bottom:6px; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1000" height="640"></canvas>
+<div id="hud">
+  <div>Battery: <span id="battery">100%</span></div>
+  <div>DRS: <span id="drs">OFF</span></div>
+  <div>Damage: <span id="damage">0%</span></div>
+  <div>Penalties: <span id="penalties">0</span></div>
+  <div>Lap: <span id="lap">1</span></div>
+  <div>Speed: <span id="speed">0</span> km/h</div>
+  <div>Position: <span id="pos">1</span>/<span id="total">1</span></div>
+</div>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+// Track
+const track = {centerX: W/2, centerY: H/2, radiusX:360, radiusY:220, width:80, startAngle:-Math.PI/2};
+function pointOnTrack(t, offset=0){ const a = track.startAngle + t*2*Math.PI; return {x: track.centerX + Math.cos(a)*(track.radiusX+offset), y: track.centerY + Math.sin(a)*(track.radiusY+offset), a}; }
+const WAYPOINTS=[]; for(let i=0;i<24;i++) WAYPOINTS.push(pointOnTrack(i/24));
+
+// DRS Zones: each zone is [startT, endT] (t=0–1 along track)
+const DRS_ZONES = [
+  [0.0, 0.08],
+  [0.4, 0.5],
+  [0.7, 0.78]
+];
+
+// Player
+let player = {x: pointOnTrack(0).x, y:pointOnTrack(0).y-30, angle:pointOnTrack(0).a, vel:0, damage:0, penalties:0, lap:1, battery:100, drs:false, inPit:false, pitTimer:0, t:0, name:'Player'};
+const bots = [];
+for(let i=0;i<3;i++){ 
+  const p = pointOnTrack(Math.random()); 
+  bots.push({x:p.x+Math.random()*20-10, y:p.y+Math.random()*20-10, angle:p.a, vel:3+Math.random()*2, damage:0, penalties:0, lap:1, battery:50, drs:false, inPit:false, pitTimer:0, t:Math.random(), name:'Bot'+(i+1)});
+}
+
+// Input
+const input = {up:false, down:false, left:false, right:false, ers:false, drs:false};
+window.addEventListener('keydown', e=>{
+  if(['ArrowUp','w'].includes(e.key)) input.up=true;
+  if(['ArrowDown','s'].includes(e.key)) input.down=true;
+  if(['ArrowLeft','a'].includes(e.key)) input.left=true;
+  if(['ArrowRight','d'].includes(e.key)) input.right=true;
+  if(e.key==='e' || e.key==='E') input.ers=true;
+  if(e.key==='d' || e.key==='D') input.drs=true;
+});
+window.addEventListener('keyup', e=>{
+  if(['ArrowUp','w'].includes(e.key)) input.up=false;
+  if(['ArrowDown','s'].includes(e.key)) input.down=false;
+  if(['ArrowLeft','a'].includes(e.key)) input.left=false;
+  if(['ArrowRight','d'].includes(e.key)) input.right=false;
+  if(e.key==='e' || e.key==='E') input.ers=false;
+  if(e.key==='d' || e.key==='D') input.drs=false;
+});
+
+// Utils
+function lerp(a,b,t){return a+(b-a)*t;}
+function lerpAngle(a,b,t){let d=b-a; while(d>Math.PI)d-=2*Math.PI; while(d<-Math.PI)d+=2*Math.PI; return a+d*t; }
+function distance(a,b){return Math.hypot(a.x-b.x,a.y-b.y);}
+function estimateTFromPos(x,y){let bestT=0,bestD=1e9;for(let i=0;i<200;i++){const t=i/200,p=pointOnTrack(t);const d=Math.hypot(p.x-x,p.y-y); if(d<bestD){bestD=d;bestT=t;bestD=d;}}return bestT;}
+
+// Check DRS availability
+function isInDRSZone(car){
+  return DRS_ZONES.some(z=>{ if(z[0]<z[1]) return car.t>=z[0] && car.t<=z[1]; else return car.t>=z[0] || car.t<=z[1]; });
+}
+
+// Update
+function updateCar(car, dt, inp){
+  if(car.inPit){
+    car.pitTimer -= dt;
+    if(car.pitTimer<=0){ car.inPit=false; car.damage=0; car.battery=100; car.vel=0; }
+    return;
+  }
+
+  // Steering
+  let steer=0; if(inp.left) steer=-1; if(inp.right) steer=1;
+  car.angle += steer*0.04*(car.vel/2+0.5);
+
+  // Acceleration
+  if(inp.up) car.vel = Math.min(9, car.vel+0.18*dt*60);
+  if(inp.down) car.vel = Math.max(0, car.vel-0.35*dt*60);
+  car.vel = Math.max(0, car.vel-0.02*dt*60);
+
+  // ERS / Battery
+  if(inp.ers && car.battery>0){
+    car.vel += 0.5; // ERS boost
+    car.battery -= 25*dt;
+    if(car.battery<0) car.battery=0;
+  } else {
+    car.battery += 15*dt; // regenerate
+    if(car.battery>100) car.battery=100;
+  }
+
+  // DRS activation in zone only
+  car.drs = inp.drs && isInDRSZone(car);
+  if(car.drs) car.vel += 0.6;
+
+  car.x += Math.cos(car.angle)*car.vel*dt*60;
+  car.y += Math.sin(car.angle)*car.vel*dt*60;
+
+  const prevT = car.t;
+  car.t = estimateTFromPos(car.x, car.y);
+  if(prevT>0.9 && car.t<0.1) car.lap++;
+
+  // Auto pit
+  if(car.damage>50 && !car.inPit){ car.inPit=true; car.pitTimer=2.5 + Math.random()*0.7; car.vel=0; }
+}
+
+// Bot AI
+function updateBot(bot, dt){
+  if(bot.inPit){ updateCar(bot, dt, {}); return; }
+  const wpIdx = Math.floor(bot.t*24)%24;
+  const wp = pointOnTrack((wpIdx+1)/24);
+  const dx = wp.x-bot.x, dy = wp.y-bot.y;
+  const desired = Math.atan2(dy,dx);
+  let da = desired - bot.angle; while(da<=-Math.PI) da+=2*Math.PI; while(da>Math.PI) da-=2*Math.PI;
+  bot.angle += Math.sign(da)*Math.min(0.06, Math.abs(da));
+  bot.vel = 4+Math.random()*2;
+  updateCar(bot, dt, {});
+}
+
+// Collision
+function handleCollisions(){
+  const cars = [player, ...bots];
+  for(let i=0;i<cars.length;i++){
+    for(let j=i+1;j<cars.length;j++){
+      const a=cars[i], b=cars[j];
+      const d = distance(a,b);
+      if(d<22){
+        const rel = Math.abs(a.vel-b.vel);
+        const impact = Math.min(60, rel*20+10);
+        a.damage = Math.min(100, a.damage+impact*0.6);
+        b.damage = Math.min(100, b.damage+impact*0.6);
+        a.penalties++; b.penalties++;
+      }
+    }
+  }
+}
+
+// Draw
+function drawCar(c){
+  ctx.save(); ctx.translate(c.x,c.y); ctx.rotate(c.angle);
+  ctx.fillStyle=c.name.startsWith('Bot')?'#f44':'#5fe'; ctx.fillRect(-12,-8,24,16);
+  if(c.drs){ ctx.fillStyle='yellow'; ctx.fillRect(-12,6,10,3); }
+  ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(-12,-16,24,4);
+  ctx.fillStyle='red'; ctx.fillRect(-12,-16,24*(1-c.damage/100),4);
+  ctx.restore();
+}
+
+function render(){
+  ctx.clearRect(0,0,W,H);
+  // track
+  ctx.save(); ctx.translate(track.centerX,track.centerY);
+  ctx.beginPath(); ctx.ellipse(0,0,track.radiusX+track.width/2,track.radiusY+track.width/2,0,0,Math.PI*2); ctx.fillStyle='#2b4c66'; ctx.fill();
+  ctx.beginPath(); ctx.ellipse(0,0,track.radiusX-track.width/2,track.radiusY-track.width/2,0,0,Math.PI*2); ctx.fillStyle='#071827'; ctx.fill(); ctx.restore();
+  // start/finish
+  const p1=pointOnTrack(0,-track.width/2-6), p2=pointOnTrack(0,track.width/2+6); ctx.strokeStyle='#fff'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(p1.x,p1.y); ctx.lineTo(p2.x,p2.y); ctx.stroke();
+  // cars
+  const allCars = [player,...bots];
+  allCars.forEach(c=>drawCar(c));
+  // HUD
+  document.getElementById('battery').textContent = Math.round(player.battery)+'%';
+  document.getElementById('drs').textContent = player.drs?'OPEN':'OFF';
+  document.getElementById('damage').textContent = Math.round(player.damage)+'%';
+  document.getElementById('penalties').textContent = player.penalties;
+  document.getElementById('lap').textContent = player.lap;
+  document.getElementById('speed').textContent = Math.round(player.vel*30);
+  const rankList = allCars.sort((a,b)=>b.lap-a.lap || b.t-a.t);
+  const pos = rankList.indexOf(player)+1;
+  document.getElementById('pos').textContent = pos;
+  document.getElementById('total').textContent = allCars.length;
+}
+
+// Game loop
+let last = performance.now();
+function loop(t){
+  const dt = Math.min(0.05,(t-last)/1000); last=t;
+  updateCar(player, dt, input);
+  bots.forEach(b=>updateBot(b, dt));
+  handleCollisions();
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
